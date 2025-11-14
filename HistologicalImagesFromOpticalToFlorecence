@@ -72,7 +72,11 @@ if (bitDepth1 != 24) {
 run("Colour Deconvolution", "vectors=[FastRed FastBlue DAB]");
 
 selectImage(name1+" (RGB)-(Colour_1)");
-outputCH1name1 = getString("Enter the name for the 1st channel: ", "CD163");
+Dialog.create("");
+Dialog.addMessage("Select name for CH1");
+Dialog.addChoice("name", newArray("CD163", "CD3"), "CD163");
+Dialog.show();
+outputCH1name1 = Dialog.getChoice();
 saveAs("Tiff", dir2Subfolder + name1WithoutExtension + outputROIname1 + "_" + outputCH1name1 + ".tif");
 run("8-bit");
 run("Invert");
@@ -81,7 +85,11 @@ run("Duplicate...", " ");
 saveAs("Tiff", dir2Subfolder + name1WithoutExtension + outputROIname1 + "_" + outputCH1name1 + "_BN-1.tif");
 
 selectImage(name1+" (RGB)-(Colour_2)");
-outputCH2name1 = getString("Enter the name for the 2nd channel: ", "NUCLEI");
+Dialog.create("");
+Dialog.addMessage("Select name for CH2");
+Dialog.addChoice("name", newArray("NUCLEI"), "NUCLEI");
+Dialog.show();
+outputCH2name1 = Dialog.getChoice();
 saveAs("Tiff", dir2Subfolder + name1WithoutExtension + outputROIname1 + "_" + outputCH2name1 + ".tif");
 run("8-bit");
 run("Invert");
@@ -90,7 +98,11 @@ run("Duplicate...", " ");
 saveAs("Tiff", dir2Subfolder + name1WithoutExtension + outputROIname1 + "_" + outputCH2name1 + "_BN-1.tif");
 
 selectImage(name1+" (RGB)-(Colour_3)");
-outputCH3name1 = getString("Enter the name for the 3rd channel: ", "CD8");
+Dialog.create("");
+Dialog.addMessage("Select name for CH3");
+Dialog.addChoice("name", newArray("CD8", "CD20"), "CD8");
+Dialog.show();
+outputCH3name1 = Dialog.getChoice();
 saveAs("Tiff", dir2Subfolder + name1WithoutExtension + outputROIname1 + "_" + outputCH3name1 + ".tif");
 run("8-bit");
 run("Invert");
@@ -257,8 +269,11 @@ if(selectionString2 == "A"){
 	run("Merge Channels...", "c1=[" + name1WithoutExtension + outputROIname1 + "_" + outputCH3name1 + "_DEF.tif] c2=[" + name1WithoutExtension + outputROIname1 + "_" + outputCH1name1 + "_DEF.tif] c3=[" + name1WithoutExtension + outputROIname1 + "_" + outputCH2name1 + "_DEF.tif] create");
 }
 run("Stack to RGB");
+rename("Composite_to_Clean");
 
-// === Function for manual cleaning of a single color channel ===
+// === Function for manual cleaning (MODIFIED) ===
+// This function ONLY creates a mask from the user's drawing on the active color image.
+// It does NOT apply the mask or split the channels.
 function manualChannelCleaning(channelColor, channelLabel) {
     selectionManual = getString("Enter YES to manually remove areas from the " + channelColor + " channel (" + channelLabel + ")", "NO");
     if (selectionManual != "YES") return "NO"; 
@@ -266,86 +281,96 @@ function manualChannelCleaning(channelColor, channelLabel) {
     print("Draw all regions you want to remove from the " + channelColor + " channel.");
     print("Tip: Hold SHIFT while drawing to add multiple regions to the same selection.");
 
-    // Split channels only if image is RGB
-    bitDepth1 = bitDepth();
-    if (bitDepth1 == 24) {
-        run("Split Channels");
-    }
-
-    // Identify correct channel
-    titles = getList("image.titles");
-    channelTitle = "";
-    for (i = 0; i < titles.length; i++) {
-        if (endsWith(titles[i], "(" + channelColor + ")")) {
-            channelTitle = titles[i];
-        }
-    }
-
-    if (channelTitle == "") {
-        exit("Error: " + channelColor + " channel not found!");
-    }
-
-    selectImage(channelTitle);
+    selectImage(getTitle());
     setTool("freehand");
 
-    // Let user draw multiple freehand regions using SHIFT
-    waitForUser("Draw all areas to remove on the " + channelColor + " channel.\nHold SHIFT to add multiple regions.\nClick OK when finished.");
+    waitForUser("Draw all areas to remove on the COLOR image for " + channelLabel + ".\nHold SHIFT to add multiple regions.\nClick OK when finished.");
 
-    // Create mask from final multi-region selection
+    
+    if (selectionType() == -1) { // -1 significa "nessuna selezione"
+        print("No selection made. Skipping manual cleaning for " + channelColor + ".");
+        return "NO"; // Ritorna "NO" come se l'utente avesse annullato
+    }
+
+    // Create mask
     run("Create Mask");
     rename("ManualMask_" + channelColor);
-    run("Invert");
-    run("Divide...", "value=255.000");
+    print("Mask created for al " + channelColor);
+    
+    run("Select None"); 
 
-    // Apply the mask (remove selected regions)
-    imageCalculator("Multiply create", channelTitle, "ManualMask_" + channelColor);
-    selectImage("Result of " + channelTitle);
-    rename(channelColor + "_Updated");
-
-    // Cleanup
-    close(channelTitle);
-    close("ManualMask_" + channelColor);
-
-    print("Manual multi-region mask applied to the " + channelColor + " channel.");
-
-    return "YES";
+    return "YES"; 
 }
 
 
 // === MANUAL CLEANING ON GREEN (CD8) AND RED (CD163) CHANNELS ===
-manualAppliedGreen = manualChannelCleaning("green", "CD8");
-manualAppliedRed  = manualChannelCleaning("red", "CD163");
+manualAppliedRed  = manualChannelCleaning("red", outputCH1name1);
+manualAppliedGreen = manualChannelCleaning("green", outputCH3name1);
 
 
+
+// === Split the composite image ONCE (dopo aver disegnato) ===
+
+
+selectImage("Composite_to_Clean"); 
 
 bitDepth1 = bitDepth();
 if (bitDepth1 == 24) {
-	run("Split Channels");
+	run("Split Channels"); 
 }
 
 // === Rebuild final RGB image ===
 titles = getList("image.titles");
 
-// Initialize variables
+// Inizializza le variabili
 redUpdated = "";
 greenUpdated = "";
 blueTitle = "";
 
-// Identify default channel titles
+// Identifica i titoli dei canali B/N appena divisi
 for (i = 0; i < titles.length; i++) {
     if (endsWith(titles[i], "(red)"))   redUpdated = titles[i];
     if (endsWith(titles[i], "(green)")) greenUpdated = titles[i];
     if (endsWith(titles[i], "(blue)"))  blueTitle = titles[i];
 }
 
-// If manual cleaning was applied, use the updated versions instead
-if (manualAppliedRed == "YES")   redUpdated = "red_Updated";
-if (manualAppliedGreen == "YES") greenUpdated = "green_Updated";
+// === Applica le maschere se sono state create ===
+
+if (manualAppliedRed == "YES") {
+    print("Applying manual mask to CH1 channel...");
+    // Prepara la maschera
+    selectImage("ManualMask_red");
+    run("Invert");
+    run("Divide...", "value=255.000");
+    // Applica la maschera al canale B/N
+    imageCalculator("Multiply create", redUpdated, "ManualMask_red");
+    close(redUpdated); // Chiude il canale rosso originale (sporco)
+    close("ManualMask_red");
+    selectImage("Result of " + redUpdated);
+    rename("red_Updated"); // Rinomina il risultato
+    redUpdated = "red_Updated"; // Aggiorna la variabile per il merge finale
+}
+
+if (manualAppliedGreen == "YES") {
+    print("Applying manual mask to CH3 channel...");
+    // Prepara la maschera
+    selectImage("ManualMask_green");
+    run("Invert");
+    run("Divide...", "value=255.000");
+    // Applica la maschera al canale B/N
+    imageCalculator("Multiply create", greenUpdated, "ManualMask_green");
+    close(greenUpdated); // Chiude il canale verde originale (sporco)
+    close("ManualMask_green");
+    selectImage("Result of " + greenUpdated);
+    rename("green_Updated"); // Rinomina il risultato
+    greenUpdated = "green_Updated"; // Aggiorna la variabile per il merge finale
+}
 
 // Merge final RGB image
 run("Merge Channels...", "c1=[" + redUpdated + "] c2=[" + greenUpdated + "] c3=[" + blueTitle + "] create");
 run("Stack to RGB");
 
+// Pulisci i canali B/N finali
 close(redUpdated);
 close(greenUpdated);
 close(blueTitle);
@@ -367,7 +392,7 @@ logText += "CH1 (" + outputCH1name1 + "):\n";
 logText += "  Threshold algorithm: " + algoCH1 + "\n";
 logText += "  Median filter applied: " + medianAppliedCH1 + "\n";
 logText += "  Median radius: " + medianRadiusCH1 + "\n\n";
-logText += "Manual cleaning (freehand mask) applied to RED channel (CD163): " + manualAppliedRed + "\n\n";
+logText += "Manual cleaning (freehand mask) applied to CH1 channel: " + manualAppliedRed + "\n\n";
 logText += "\n";
 
 logText += "CH2 (" + outputCH2name1 + "):\n";
@@ -380,7 +405,7 @@ logText += "CH3 (" + outputCH3name1 + "):\n";
 logText += "  Threshold algorithm: " + algoCH3 + "\n";
 logText += "  Median filter applied: " + medianAppliedCH3 + "\n";
 if (medianAppliedCH3 == "YES") logText += "  Median radius: " + medianRadiusCH3 + "\n\n";
-logText += "Manual cleaning (freehand mask) applied to GREEN channel (CD8): " + manualAppliedGreen + "\n\n";
+logText += "Manual cleaning (freehand mask) applied to CH2 channel: " + manualAppliedGreen + "\n\n";
 
 File.saveString(logText, logFile);
 print("Processing log saved at: " + logFile);
