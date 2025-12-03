@@ -1,0 +1,68 @@
+import qupath.lib.objects.PathObjects
+import qupath.lib.roi.ROIs
+
+class ManualCellSplitter {
+
+    /**
+     * Split dei blob in cerchi per coprire tutta l'area
+     */
+    static List splitByDiameter(String channelName, double diameter) {
+
+        def blobs = getDetectionObjects().findAll {
+            it.getPathClass() == getPathClass(channelName)
+        }
+
+        if (blobs.isEmpty()) {
+            print "Nessun blob trovato per il canale ${channelName}."
+            return []
+        }
+
+        def newCells = []
+
+        blobs.each { blob ->
+
+            def roi = blob.getROI()
+            def xMin = roi.getBoundsX()
+            def yMin = roi.getBoundsY()
+            def w = roi.getBoundsWidth()
+            def h = roi.getBoundsHeight()
+
+            int nCols = Math.ceil(w / diameter) as int
+            int nRows = Math.ceil(h / diameter) as int
+            double stepX = w / nCols
+            double stepY = h / nRows
+
+            for (int r = 0; r < nRows; r++) {
+                for (int c = 0; c < nCols; c++) {
+
+                    double cx = xMin + c * stepX + stepX/2
+                    double cy = yMin + r * stepY + stepY/2
+
+                    // Verifica se il centro del cerchio è dentro la ROI originale
+                    if (!roi.contains(cx, cy)) continue
+
+                    // Crea cerchio centrato sul punto
+                    def circleROI = ROIs.createEllipseROI(
+                        cx - diameter/2,
+                        cy - diameter/2,
+                        diameter,
+                        diameter,
+                        null
+                    )
+
+                    newCells << PathObjects.createDetectionObject(circleROI, getPathClass(channelName))
+                }
+            }
+        }
+
+        // Rimuovi blob originali e aggiungi nuove cellule
+        removeObjects(blobs, true)
+        addObjects(newCells)
+
+        print "Split completato: create ${newCells.size()} nuovi cerchi nel canale ${channelName}."
+        return newCells
+    }
+}
+
+// Uso
+ManualCellSplitter.splitByDiameter("Magenta", 30)
