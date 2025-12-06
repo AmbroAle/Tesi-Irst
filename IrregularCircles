@@ -1,7 +1,6 @@
 import qupath.lib.objects.PathObjects
 import qupath.lib.roi.ROIs
 import qupath.lib.roi.RoiTools
-import qupath.lib.roi.RoiTools.CombineOp
 import qupath.lib.regions.ImagePlane
 import java.awt.geom.Area
 
@@ -16,16 +15,17 @@ if (selected.isEmpty()) {
 
 def blobROI = selected[0].getROI()
 
-// --------------------------------------------
+// --------------------------------------------------------
 // PARAMETRI
-// --------------------------------------------
-int cellSize = 20   // risoluzione della "griglia"
+// --------------------------------------------------------
+int cellSize = 20      // risoluzione griglia
 double maxDist = 999999
-def plane = ImagePlane.getDefaultPlane()   // piano di riferimento
+double margin = 50     // margine per filtrare cerchi vicini
+def plane = ImagePlane.getDefaultPlane()
 
-// --------------------------------------------
+// --------------------------------------------------------
 // 1) Prendi tutti i cerchi già creati
-// --------------------------------------------
+// --------------------------------------------------------
 def cerchiObjs = hierarchy.getFlattenedObjectList(null)
         .findAll { it.getROI() instanceof qupath.lib.roi.EllipseROI }
 
@@ -36,9 +36,9 @@ if (cerchiObjs.isEmpty()) {
 
 def cerchi = cerchiObjs.collect { it.getROI() }
 
-// --------------------------------------------
-// 2) Calcola il residuo del blob: blob - tutti i cerchi
-// --------------------------------------------
+// --------------------------------------------------------
+// 2) Calcola residuo = blob - cerchi
+// --------------------------------------------------------
 def residuo = blobROI
 cerchi.each { c ->
     residuo = RoiTools.subtract(residuo, c)
@@ -49,70 +49,103 @@ if (residuo == null) {
     return
 }
 
-// --------------------------------------------
-// 3) Spezza il residuo in piccoli quadrati (celle)
-// --------------------------------------------
+// --------------------------------------------------------
+// 3) Precalcolo BOUNDING BOX esteso per ogni cerchio (OTTIMIZZAZIONE)
+// --------------------------------------------------------
+def cerchiBounds = [:]
+
+cerchi.each { c ->
+    def r = c.getBoundsWidth() / 2
+    def cx = c.getCentroidX()
+    def cy = c.getCentroidY()
+
+    cerchiBounds[c] = [
+        minX: cx - r - margin,
+        maxX: cx + r + margin,
+        minY: cy - r - margin,
+        maxY: cy + r + margin
+    ]
+}
+
+// --------------------------------------------------------
+// 4) Spezza residuo in celle e assegnale al cerchio più vicino
+// --------------------------------------------------------
 def boundsX = residuo.getBoundsX()
 def boundsY = residuo.getBoundsY()
 def boundsW = residuo.getBoundsWidth()
 def boundsH = residuo.getBoundsHeight()
 
-def cellePerCerchio = [:]  // mappa: cerchio → lista celle
+def cellePerCerchio = [:]
 cerchi.each { cellePerCerchio[it] = [] }
 
-// genera griglia
 for (double y = boundsY; y < boundsY + boundsH; y += cellSize) {
     for (double x = boundsX; x < boundsX + boundsW; x += cellSize) {
 
         def cellROI = ROIs.createRectangleROI(x, y, cellSize, cellSize)
-        def cellArea = new Area(cellROI.getShape())           // converti in Area
+        def cellArea = new Area(cellROI.getShape())
         def residuoArea = new Area(residuo.getShape())
-        cellArea.intersect(residuoArea)                       // intersezione
 
+        cellArea.intersect(residuoArea)
         if (cellArea.isEmpty())
             continue
 
-        // crea ROI da Area
         def cellInside = RoiTools.getShapeROI(cellArea, plane)
 
-        // trova cerchio più vicino
+        // centro della cella
+        def cellCx = x + cellSize / 2
+        def cellCy = y + cellSize / 2
+
+        // -------------------------------
+        // FILTRAGGIO CERCHI VICINI
+        // -------------------------------
+        def candidati = cerchi.findAll { c ->
+            def b = cerchiBounds[c]
+            return (cellCx >= b.minX && cellCx <= b.maxX &&
+                    cellCy >= b.minY && cellCy <= b.maxY)
+        }
+
+        // nessun candidato → fallback: controlla tutti
+        if (candidati.isEmpty())
+            candidati = cerchi
+
+        // scegli il cerchio più vicino
         double bestDist = maxDist
         def bestCircle = null
 
-        cerchi.each { c ->
+        candidati.each { c ->
             def cx = c.getCentroidX()
             def cy = c.getCentroidY()
-            def dist = Math.hypot(cx - (x + cellSize / 2), cy - (y + cellSize / 2))
+            def dist = Math.hypot(cx - cellCx, cy - cellCy)
             if (dist < bestDist) {
                 bestDist = dist
                 bestCircle = c
             }
         }
 
-        // assegna cella al cerchio più vicino
         cellePerCerchio[bestCircle] << cellInside
     }
 }
 
-// --------------------------------------------
-// 4) Per ogni cerchio → unisci solo le celle assegnate
-// --------------------------------------------
+// --------------------------------------------------------
+// 5) Genera nuove ROI finali (cerchio + celle assegnate)
+// --------------------------------------------------------
 def finalShapes = []
 
 cerchi.each { c ->
-    def shapeArea = new Area(c.getShape())   // parte dal cerchio
+    def shapeArea = new Area(c.getShape())
     cellePerCerchio[c].each { cell ->
-        shapeArea.add(new Area(cell.getShape()))   // unisci
+        shapeArea.add(new Area(cell.getShape()))
     }
     def finalROI = RoiTools.getShapeROI(shapeArea, plane)
     finalShapes << finalROI
 }
 
-// --------------------------------------------
-// 5) Crea le detection finali
-// --------------------------------------------
-finalShapes.each {
-    hierarchy.addObject(PathObjects.createDetectionObject(it))
+// --------------------------------------------------------
+// 6) Aggiungi oggetti finali all’hierarchia
+// --------------------------------------------------------
+finalShapes.each { roi ->
+    def det = PathObjects.createDetectionObject(roi)
+    hierarchy.addObject(det)
 }
 
-print "Creati ${finalShapes.size()} oggetti cellulari irregolari assegnando il residuo al cerchio più vicino!"
+print "Creati ${finalShapes.size()} oggetti assegnando il residuo al cerchio più vicino con filtraggio ottimizzato!"
