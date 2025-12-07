@@ -1,0 +1,151 @@
+import qupath.lib.objects.PathObjects
+import qupath.lib.roi.*
+import qupath.lib.roi.RoiTools
+import qupath.lib.regions.ImagePlane
+import java.awt.geom.Area
+import java.awt.geom.Rectangle2D
+
+// PARAMETRI
+def channelName = "Magenta"
+def diametro = 30
+def cellSize = 20
+def margin = 50
+def maxDist = 999999
+
+def imageData = getCurrentImageData()
+def hierarchy = imageData.getHierarchy()
+def plane = ImagePlane.getDefaultPlane()
+
+// Recupera tutti i blob del canale
+def blobs = getDetectionObjects().findAll { it.getPathClass() == getPathClass(channelName) }
+if (blobs.isEmpty()) {
+    print "Nessun blob trovato per il canale ${channelName}."
+    return
+}
+
+blobs.each { blob ->
+
+    def blobROI = blob.getROI()
+    if (!blobROI) return
+
+    def blobClass = blob.getPathClass()
+
+    // -----------------------------
+    // 1) Crea griglia di cerchi regolari
+    // -----------------------------
+    def xMin = blobROI.getBoundsX()
+    def yMin = blobROI.getBoundsY()
+    def w = blobROI.getBoundsWidth()
+    def h = blobROI.getBoundsHeight()
+    def raggio = diametro / 2.0
+
+    int nCols = Math.ceil(w / diametro) as int
+    int nRows = Math.ceil(h / diametro) as int
+    double stepX = w / nCols
+    double stepY = h / nRows
+
+    def cerchiFinali = []
+    for (int r = 0; r < nRows; r++) {
+        for (int c = 0; c < nCols; c++) {
+            def cx = xMin + c * stepX + stepX / 2
+            def cy = yMin + r * stepY + stepY / 2
+            if (!blobROI.contains(cx, cy)) continue
+            def nuovoCerchio = ROIs.createEllipseROI(cx - raggio, cy - raggio, diametro, diametro)
+            cerchiFinali << PathObjects.createDetectionObject(nuovoCerchio, blobClass)
+        }
+    }
+
+    // Aggiunge i cerchi temporanei (verranno poi aggiornati con le celle irregolari)
+    hierarchy.addObjects(cerchiFinali)
+
+    // -----------------------------
+    // 2) Logica residuo (celle irregolari)
+    // -----------------------------
+    def cerchiObjs = hierarchy.getFlattenedObjectList(null)
+            .findAll { it.getROI() instanceof EllipseROI && it.getPathClass() == blobClass }
+
+    if (cerchiObjs.isEmpty()) return
+
+    def cerchi = cerchiObjs.collect { it.getROI() }
+    def residuo = blobROI
+    cerchi.each { c -> residuo = RoiTools.subtract(residuo, c) }
+    if (residuo == null) return
+
+    double boundsX = residuo.getBoundsX()
+    double boundsY = residuo.getBoundsY()
+    double boundsW = residuo.getBoundsWidth()
+    double boundsH = residuo.getBoundsHeight()
+    Rectangle2D residuoRect = new Rectangle2D.Double(boundsX, boundsY, boundsW, boundsH)
+
+    def cerchiBounds = [:]
+    cerchi.each { c ->
+        def r = c.getBoundsWidth() / 2
+        def cx = c.getCentroidX()
+        def cy = c.getCentroidY()
+        cerchiBounds[c] = [
+            minX: cx - r - margin,
+            maxX: cx + r + margin,
+            minY: cy - r - margin,
+            maxY: cy + r + margin
+        ]
+    }
+
+    def cellePerCerchio = [:]
+    cerchi.each { cellePerCerchio[it] = new Area() }
+
+    for (double y = boundsY; y < boundsY + boundsH; y += cellSize) {
+        for (double x = boundsX; x < boundsX + boundsW; x += cellSize) {
+            Rectangle2D cellRect = new Rectangle2D.Double(x, y, cellSize, cellSize)
+            if (!residuoRect.intersects(cellRect)) continue
+
+            def cellArea = new Area(cellRect)
+            cellArea.intersect(new Area(residuo.getShape()))
+            if (cellArea.isEmpty()) continue
+
+            def cellCx = x + cellSize / 2
+            def cellCy = y + cellSize / 2
+
+            def candidati = cerchi.findAll { c ->
+                def b = cerchiBounds[c]
+                return (cellCx >= b.minX && cellCx <= b.maxX &&
+                        cellCy >= b.minY && cellCy <= b.maxY)
+            }
+            if (candidati.isEmpty()) candidati = cerchi
+
+            double bestDist = maxDist
+            def bestCircle = null
+            candidati.each { c ->
+                def cx = c.getCentroidX()
+                def cy = c.getCentroidY()
+                def dist = Math.hypot(cx - cellCx, cy - cellCy)
+                if (dist < bestDist) {
+                    bestDist = dist
+                    bestCircle = c
+                }
+            }
+
+            if (bestCircle != null)
+                cellePerCerchio[bestCircle].add(cellArea)
+        }
+    }
+
+    def finalShapes = []
+    cerchi.each { c ->
+        def shapeArea = new Area(c.getShape())
+        shapeArea.add(cellePerCerchio[c])
+        def finalROI = RoiTools.getShapeROI(shapeArea, plane)
+        finalShapes << PathObjects.createDetectionObject(finalROI, blobClass)
+    }
+
+    // -----------------------------
+    // 3) Pulizia: rimuove il blob originale + cerchi temporanei
+    // -----------------------------
+    removeObjects([blob] + cerchiFinali, true)
+
+    // 4) Aggiunge le nuove detections finali
+    addObjects(finalShapes)
+
+    print "Blob processato: create ${finalShapes.size()} detections irregolari."
+}
+
+print "Tutti i blob processati."
