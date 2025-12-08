@@ -3,20 +3,20 @@ import qupath.lib.roi.*
 import qupath.lib.roi.RoiTools
 import qupath.lib.regions.ImagePlane
 import java.awt.geom.Area
-import java.awt.geom.Rectangle2D
 
-// PARAMETRI
-def channelName = "Magenta"
-def diametro = 30
-def cellSize = 20
-def margin = 50
+// ================== PARAMETRI ==================
+def channelName = "Yellow"
+def diametro = 15             // Diametro cerchi / esagoni
+def raggio = diametro / 2.0
+def cellSize = diametro / 2   // Celle per assegnazione residuo
+def margin = diametro
 def maxDist = 999999
 
 def imageData = getCurrentImageData()
 def hierarchy = imageData.getHierarchy()
 def plane = ImagePlane.getDefaultPlane()
 
-// Recupera tutti i blob del canale
+// Recupera tutti i blob
 def blobs = getDetectionObjects().findAll { it.getPathClass() == getPathClass(channelName) }
 if (blobs.isEmpty()) {
     print "Nessun blob trovato per il canale ${channelName}."
@@ -27,59 +27,52 @@ blobs.each { blob ->
 
     def blobROI = blob.getROI()
     if (!blobROI) return
-
     def blobClass = blob.getPathClass()
 
-    // -----------------------------
-    // 1) Crea griglia di cerchi regolari
-    // -----------------------------
     def xMin = blobROI.getBoundsX()
     def yMin = blobROI.getBoundsY()
     def w = blobROI.getBoundsWidth()
     def h = blobROI.getBoundsHeight()
-    def raggio = diametro / 2.0
 
+    // ================== 1) CREA CERCHI ESAGONALI ==================
+    def cerchi = []
+
+    // calcola altezza esagono
+    double hexHeight = Math.sqrt(3) * raggio
+
+    int nRows = Math.ceil(h / hexHeight) as int
     int nCols = Math.ceil(w / diametro) as int
-    int nRows = Math.ceil(h / diametro) as int
-    double stepX = w / nCols
-    double stepY = h / nRows
 
-    def cerchiFinali = []
     for (int r = 0; r < nRows; r++) {
         for (int c = 0; c < nCols; c++) {
-            def cx = xMin + c * stepX + stepX / 2
-            def cy = yMin + r * stepY + stepY / 2
+
+            double cx = xMin + c * diametro + raggio
+            double cy = yMin + r * hexHeight + hexHeight/2
+
+            // sfalsa le righe pari
+            if (r % 2 == 1) cx += diametro / 2
+
             if (!blobROI.contains(cx, cy)) continue
-            def nuovoCerchio = ROIs.createEllipseROI(cx - raggio, cy - raggio, diametro, diametro)
-            cerchiFinali << PathObjects.createDetectionObject(nuovoCerchio, blobClass)
+
+            cerchi << ROIs.createEllipseROI(cx - raggio, cy - raggio, diametro, diametro)
         }
     }
+    if (cerchi.isEmpty()) return
 
-    // Aggiunge i cerchi temporanei (verranno poi aggiornati con le celle irregolari)
-    hierarchy.addObjects(cerchiFinali)
-
-    // -----------------------------
-    // 2) Logica residuo (celle irregolari)
-    // -----------------------------
-    def cerchiObjs = hierarchy.getFlattenedObjectList(null)
-            .findAll { it.getROI() instanceof EllipseROI && it.getPathClass() == blobClass }
-
-    if (cerchiObjs.isEmpty()) return
-
-    def cerchi = cerchiObjs.collect { it.getROI() }
+    // ================== 2) CALCOLA IL RESIDUO ==================
     def residuo = blobROI
     cerchi.each { c -> residuo = RoiTools.subtract(residuo, c) }
-    if (residuo == null) return
+    if (!residuo) return
 
-    double boundsX = residuo.getBoundsX()
-    double boundsY = residuo.getBoundsY()
-    double boundsW = residuo.getBoundsWidth()
-    double boundsH = residuo.getBoundsHeight()
-    Rectangle2D residuoRect = new Rectangle2D.Double(boundsX, boundsY, boundsW, boundsH)
+    def boundsX = residuo.getBoundsX()
+    def boundsY = residuo.getBoundsY()
+    def boundsW = residuo.getBoundsWidth()
+    def boundsH = residuo.getBoundsHeight()
 
+    // ================== 3) PREPARA CELLE PER ASSEGNAZIONE ==================
     def cerchiBounds = [:]
     cerchi.each { c ->
-        def r = c.getBoundsWidth() / 2
+        def r = c.getBoundsWidth()/2
         def cx = c.getCentroidX()
         def cy = c.getCentroidY()
         cerchiBounds[c] = [
@@ -95,57 +88,60 @@ blobs.each { blob ->
 
     for (double y = boundsY; y < boundsY + boundsH; y += cellSize) {
         for (double x = boundsX; x < boundsX + boundsW; x += cellSize) {
-            Rectangle2D cellRect = new Rectangle2D.Double(x, y, cellSize, cellSize)
-            if (!residuoRect.intersects(cellRect)) continue
 
-            def cellArea = new Area(cellRect)
+            def cellROI = ROIs.createRectangleROI(x, y, cellSize, cellSize)
+            def cellArea = new Area(cellROI.getShape())
             cellArea.intersect(new Area(residuo.getShape()))
             if (cellArea.isEmpty()) continue
 
-            def cellCx = x + cellSize / 2
-            def cellCy = y + cellSize / 2
+            def cellCx = x + cellSize/2
+            def cellCy = y + cellSize/2
 
             def candidati = cerchi.findAll { c ->
                 def b = cerchiBounds[c]
-                return (cellCx >= b.minX && cellCx <= b.maxX &&
-                        cellCy >= b.minY && cellCy <= b.maxY)
+                (cellCx >= b.minX && cellCx <= b.maxX && cellCy >= b.minY && cellCy <= b.maxY)
             }
             if (candidati.isEmpty()) candidati = cerchi
 
             double bestDist = maxDist
-            def bestCircle = null
+            def best = null
             candidati.each { c ->
-                def cx = c.getCentroidX()
-                def cy = c.getCentroidY()
-                def dist = Math.hypot(cx - cellCx, cy - cellCy)
+                def dx = c.getCentroidX() - cellCx
+                def dy = c.getCentroidY() - cellCy
+                def dist = dx*dx + dy*dy
                 if (dist < bestDist) {
                     bestDist = dist
-                    bestCircle = c
+                    best = c
                 }
             }
 
-            if (bestCircle != null)
-                cellePerCerchio[bestCircle].add(cellArea)
+            cellePerCerchio[best].add(cellArea)
         }
     }
 
-    def finalShapes = []
-    cerchi.each { c ->
-        def shapeArea = new Area(c.getShape())
-        shapeArea.add(cellePerCerchio[c])
-        def finalROI = RoiTools.getShapeROI(shapeArea, plane)
-        finalShapes << PathObjects.createDetectionObject(finalROI, blobClass)
+    // ================== 4) CREA LE DETECTIONS FINALI ==================
+    def finalObjects = cerchi.collect { c ->
+        def area = new Area(c.getShape())
+        area.add(cellePerCerchio[c])
+        area.intersect(new Area(blobROI.getShape()))
+        def finalROI = RoiTools.getShapeROI(area, plane)
+        PathObjects.createDetectionObject(finalROI, blobClass)
     }
 
-    // -----------------------------
-    // 3) Pulizia: rimuove il blob originale + cerchi temporanei
-    // -----------------------------
-    removeObjects([blob] + cerchiFinali, true)
+    hierarchy.removeObject(blob, true)
+    hierarchy.addObjects(finalObjects)
 
-    // 4) Aggiunge le nuove detections finali
-    addObjects(finalShapes)
-
-    print "Blob processato: create ${finalShapes.size()} detections irregolari."
+    print "Blob processato → ${finalObjects.size()} shapes finali."
 }
 
-print "Tutti i blob processati."
+// ================== 5) AGGIUNGI LE MISURAZIONI ==================
+addShapeMeasurements(
+    "AREA",
+    "LENGTH",
+    "CIRCULARITY",
+    "SOLIDITY",
+    "MAX_DIAMETER",
+    "MIN_DIAMETER"
+)
+
+print "Processo completato! Misurazioni aggiunte."
