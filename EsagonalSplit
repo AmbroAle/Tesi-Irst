@@ -1,0 +1,75 @@
+import qupath.lib.objects.PathObjects
+import qupath.lib.roi.*
+import qupath.lib.roi.RoiTools
+import qupath.lib.regions.ImagePlane
+import qupath.lib.geom.Point2
+import java.awt.geom.Area
+
+// ================== PARAMETRI ==================
+def channelName = "Magenta"        // Classe dei blob
+def diametro = 30                 // Diametro esagono
+double a = diametro / 2           // Distanza centro-vertice
+double stepX = 1.5 * a
+double stepY = Math.sqrt(3) * a
+
+def imageData = getCurrentImageData()
+def hierarchy = imageData.getHierarchy()
+def plane = ImagePlane.getDefaultPlane()
+
+// Recupera i blob
+def blobs = getDetectionObjects().findAll { it.getPathClass() == getPathClass(channelName) }
+if (blobs.isEmpty()) {
+    print "Nessun blob trovato!"
+    return
+}
+
+def allHexes = []
+
+blobs.each { blob ->
+
+    def roi = blob.getROI()
+    def blobArea = new Area(roi.getShape())
+
+    double xMin = roi.getBoundsX()
+    double yMin = roi.getBoundsY()
+    double w = roi.getBoundsWidth()
+    double h = roi.getBoundsHeight()
+
+    int nCols = Math.ceil(w / stepX) as int
+    int nRows = Math.ceil(h / stepY) as int
+
+    for (int col = 0; col < nCols; col++) {
+        for (int row = 0; row < nRows; row++) {
+
+            double cx = xMin + col * stepX
+            double cy = yMin + row * stepY
+            if (col % 2 == 1) cy += stepY / 2
+
+            // Costruzione esagono flat-top
+            def pts = []
+            for (int k = 0; k < 6; k++) {
+                double angle = Math.toRadians(60 * k)
+                double px = cx + a * Math.cos(angle)
+                double py = cy + a * Math.sin(angle)
+                pts << new Point2(px, py)
+            }
+
+            def hexROI = new PolygonROI(pts, plane)
+
+            // Ritaglia l’esagono al blob
+            def hexArea = new Area(hexROI.getShape())
+            hexArea.intersect(blobArea)
+
+            if (!hexArea.isEmpty()) {
+                def finalROI = RoiTools.getShapeROI(hexArea, plane)
+                allHexes << PathObjects.createDetectionObject(finalROI, blob.getPathClass())
+            }
+        }
+    }
+}
+
+// Rimuove blob originali e aggiunge esagoni
+removeObjects(blobs, true)
+addObjects(allHexes)
+
+print "Creati ${allHexes.size()} esagoni per il canale ${channelName}."
