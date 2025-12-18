@@ -1,111 +1,178 @@
 import qupath.lib.objects.PathObjects
 import qupath.lib.roi.RoiTools
 import java.awt.geom.Area
+import java.awt.BasicStroke
+import org.slf4j.LoggerFactory
 
-// ================== PARAMETRI ==================
-def channelName = "Yellow"   // Canale da processare
-def minArea = 10.0           // Area minima per fondere
-def gridSize = 200.0         // Griglia spaziale per accelerare ricerca vicini
+/**
+ * HexFusionByAdjacency
+ *
+ * This class merges small hexagonal detections into adjacent larger ones
+ * based on spatial proximity and geometric intersection.
+ * Only detections belonging to a specific class (channel) are processed.
+ */
+class HexFusionByAdjacency {
 
-def allHexes = getDetectionObjects().findAll { it.getPathClass() == getPathClass(channelName) }
-if (allHexes.isEmpty()) {
-    print "Nessun esagono trovato per il canale ${channelName}!"
-    return
-}
+    /** Detection class name to process */
+    String channelName
 
-print "Detections totali: ${allHexes.size()}"
+    /** Minimum area threshold (µm²) to distinguish big vs small hexes */
+    double minArea = 10.0
 
-// ================== CREA GRIGLIA SPAZIALE ==================
-def grid = [:].withDefault { [] }
-allHexes.each { obj ->
-    def roi = obj.getROI()
-    double cx = roi.getCentroidX()
-    double cy = roi.getCentroidY()
-    def key = [Math.floor(cx / gridSize), Math.floor(cy / gridSize)]
-    grid[key] << obj
-}
+    /** Spatial grid size (µm) used to speed up neighborhood search */
+    double gridSize = 50.0
 
-// ================== FUSIONE ==================
-def toAdd = []
-def toRemove = []
+    /** Buffer distance (µm) used to detect adjacency */
+    double buffer = 1.0
 
-def smallHexes = allHexes.findAll { it.getROI().getGeometry().getArea() < minArea }
+    /** Logger (QuPath Log panel) */
+    def logger = LoggerFactory.getLogger(HexFusionByAdjacency)
 
-smallHexes.each { small ->
-    def roiSmall = small.getROI()
-    def cx = roiSmall.getCentroidX()
-    def cy = roiSmall.getCentroidY()
-    def gx = Math.floor(cx / gridSize)
-    def gy = Math.floor(cy / gridSize)
+    /**
+     * Constructor
+     *
+     * @param channelName name of the detection class
+     */
+    HexFusionByAdjacency(String channelName) {
+        this.channelName = channelName
+    }
 
-    // Candidati vicini (celle adiacenti)
-    def candidates = []
-    for (dx in -1..1) {
-        for (dy in -1..1) {
-            def key = [gx + dx, gy + dy]
-            candidates += grid[key]
+    /**
+     * Creates a buffered Area around a ROI to allow adjacency detection.
+     *
+     * @param roi input ROI
+     * @param buffer buffer distance in microns
+     * @return buffered Area
+     */
+    Area bufferedArea(def roi, double buffer) {
+        def shape = roi.getShape()
+        def area = new Area(shape)
+        def stroke = new BasicStroke((float)(2 * buffer))
+        area.add(new Area(stroke.createStrokedShape(shape)))
+        return area
+    }
+
+    /**
+     * Executes the fusion process.
+     * Small hexes are merged into adjacent big hexes.
+     * Original detections are removed and replaced by fused ones.
+     */
+    void run() {
+
+        // ---------- LOAD DETECTIONS ----------
+        def allHexes = getDetectionObjects().findAll {
+            it.getPathClass() == getPathClass(channelName)
         }
-    }
-    candidates = candidates.findAll { it != small && !toRemove.contains(it) }
-    if (candidates.isEmpty()) return
 
-    // Trova vicino contiguo: intersezione > 0 o bounding box vicina
-    def nearest = candidates.min { c ->
-        def area1 = new Area(roiSmall.getShape())
-        def area2 = new Area(c.getROI().getShape())
-        def intersection = new Area(area1)
-        intersection.intersect(area2)
-        if (!intersection.isEmpty()) return 0.0  // Se toccano, priorità massima
-    
-        // Bounding box
-        def r1x = roiSmall.getBoundsX()
-        def r1y = roiSmall.getBoundsY()
-        def r1w = roiSmall.getBoundsWidth()
-        def r1h = roiSmall.getBoundsHeight()
-    
-        def r2x = c.getROI().getBoundsX()
-        def r2y = c.getROI().getBoundsY()
-        def r2w = c.getROI().getBoundsWidth()
-        def r2h = c.getROI().getBoundsHeight()
-    
-        double dx = Math.max(Math.max(r1x - (r2x + r2w), r2x - (r1x + r1w)), 0)
-        double dy = Math.max(Math.max(r1y - (r2y + r2h), r2y - (r1y + r1h)), 0)
-        Math.hypot(dx, dy)
-    }
+        if (allHexes.isEmpty()) {
+            logger.warn("No detections found for class {}", channelName)
+            return
+        }
 
-    if (nearest != null) {
-        // FUSIONE
-        def mergedArea = new Area(roiSmall.getShape())
-        mergedArea.add(new Area(nearest.getROI().getShape()))
-        def roi = RoiTools.getShapeROI(mergedArea, roiSmall.getImagePlane())
-        def obj = PathObjects.createDetectionObject(roi, small.getPathClass())
+        logger.info("Initial detections for {}: {}", channelName, allHexes.size())
 
-        // Misurazioni aggiornate
-        def m = obj.getMeasurementList()
-        def geom = roi.getGeometry()
-        m.put("Area µm²", geom.getArea())
-        m.put("Perimeter µm", geom.getLength())
-        m.put("BBox Width µm", roi.getBoundsWidth())
-        m.put("BBox Height µm", roi.getBoundsHeight())
-        m.put("Centroid X", roi.getCentroidX())
-        m.put("Centroid Y", roi.getCentroidY())
+        // ---------- SPLIT BIG / SMALL ----------
+        def bigHexes = allHexes.findAll {
+            it.getROI().getGeometry().getArea() >= minArea
+        }
 
-        // Rimuovi originali e aggiungi nuovo
-        toRemove << small
-        toRemove << nearest
-        toAdd << obj
+        def smallHexes = allHexes.findAll {
+            it.getROI().getGeometry().getArea() < minArea
+        }
 
-        // Aggiorna griglia
-        def newKey = [Math.floor(roi.getCentroidX() / gridSize), Math.floor(roi.getCentroidY() / gridSize)]
-        grid[newKey] << obj
+        logger.info("BIG hexes: {}", bigHexes.size())
+        logger.info("SMALL hexes: {}", smallHexes.size())
+
+        // ---------- BUILD SPATIAL GRID ----------
+        def grid = [:].withDefault { [] }
+
+        allHexes.each { obj ->
+            def roi = obj.getROI()
+            def key = [
+                Math.floor(roi.getCentroidX() / gridSize),
+                Math.floor(roi.getCentroidY() / gridSize)
+            ]
+            grid[key] << obj
+        }
+
+        // ---------- FUSION PROCESS ----------
+        def newObjects = []
+        def absorbedSmalls = [] as Set
+
+        bigHexes.each { big ->
+
+            def roiBig = big.getROI()
+            def gx = Math.floor(roiBig.getCentroidX() / gridSize)
+            def gy = Math.floor(roiBig.getCentroidY() / gridSize)
+
+            // Collect neighboring detections from adjacent grid cells
+            def candidates = []
+            for (dx in -1..1)
+                for (dy in -1..1)
+                    candidates += grid[[gx + dx, gy + dy]]
+
+            // Keep only small hexes not already absorbed
+            candidates = candidates.findAll { c ->
+                c.getROI().getGeometry().getArea() < minArea &&
+                !absorbedSmalls.contains(c)
+            }
+
+            def mergedArea = new Area(roiBig.getShape())
+            def bufferedBig = bufferedArea(roiBig, buffer)
+            def absorbedCount = 0
+
+            // Check adjacency and merge intersecting small hexes
+            candidates.each { small ->
+                def a = new Area(bufferedBig)
+                a.intersect(new Area(small.getROI().getShape()))
+                if (!a.isEmpty()) {
+                    mergedArea.add(new Area(small.getROI().getShape()))
+                    absorbedSmalls << small
+                    absorbedCount++
+                }
+            }
+
+            // Create the fused detection
+            def newROI = RoiTools.getShapeROI(mergedArea, roiBig.getImagePlane())
+            def newObj = PathObjects.createDetectionObject(newROI, big.getPathClass())
+
+            // ---------- MEASUREMENTS ----------
+            def geom = newROI.getGeometry()
+            def m = newObj.getMeasurementList()
+
+            m.put("Area µm²", geom.getArea())
+            m.put("Perimeter µm", geom.getLength())
+            m.put("Centroid X µm", newROI.getCentroidX())
+            m.put("Centroid Y µm", newROI.getCentroidY())
+            m.put("BBox Width µm", newROI.getBoundsWidth())
+            m.put("BBox Height µm", newROI.getBoundsHeight())
+            m.put("Absorbed small hexes", absorbedCount)
+
+            newObjects << newObj
+
+            logger.debug(
+                "BIG @ ({}, {}) → absorbed {}",
+                roiBig.getCentroidX().round(1),
+                roiBig.getCentroidY().round(1),
+                absorbedCount
+            )
+        }
+
+        // ---------- CLEANUP ----------
+        logger.info("Removing {} original detections", allHexes.size())
+        removeObjects(allHexes, true)
+
+        logger.info("Adding {} fused detections", newObjects.size())
+        addObjects(newObjects)
+
+        logger.info(
+            "Fusion completed for {} → final detections: {}",
+            channelName,
+            newObjects.size()
+        )
     }
 }
 
-// ================== AGGIORNA QUIPATH ==================
-allHexes.removeAll(toRemove)
-allHexes.addAll(toAdd)
-
-removeObjects(getDetectionObjects().findAll { it.getPathClass() == getPathClass(channelName) }, true)
-addObjects(allHexes)
-
-print "Fusione completata. Numero esagoni finali: ${allHexes.size()}"
+// ---------- SCRIPT EXECUTION ----------
+new HexFusionByAdjacency("Yellow").run()
+new HexFusionByAdjacency("Magenta").run()
