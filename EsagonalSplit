@@ -1,75 +1,217 @@
 import qupath.lib.objects.PathObjects
 import qupath.lib.roi.*
-import qupath.lib.roi.RoiTools
 import qupath.lib.regions.ImagePlane
 import qupath.lib.geom.Point2
 import java.awt.geom.Area
+import java.awt.geom.PathIterator
+import org.slf4j.LoggerFactory
 
-// ================== PARAMETRI ==================
-def channelName = "Magenta"        // Classe dei blob
-def diametro = 30                 // Diametro esagono
-double a = diametro / 2           // Distanza centro-vertice
-double stepX = 1.5 * a
-double stepY = Math.sqrt(3) * a
+/**
+ * HexGridFromBlobs
+ *
+ * This class generates a hexagonal grid over detection objects (blobs)
+ * belonging to a specific class (channel). Each blob is subdivided into
+ * hexagonal regions, intersected with the original blob shape.
+ * Disconnected regions resulting from the intersection are automatically split.
+ *
+ * The original blob detections are removed and replaced by the generated
+ * hexagonal detections.
+ */
+class HexGridFromBlobs {
 
-def imageData = getCurrentImageData()
-def hierarchy = imageData.getHierarchy()
-def plane = ImagePlane.getDefaultPlane()
+    /** Name of the detection class to process */
+    String channelName
 
-// Recupera i blob
-def blobs = getDetectionObjects().findAll { it.getPathClass() == getPathClass(channelName) }
-if (blobs.isEmpty()) {
-    print "Nessun blob trovato!"
-    return
-}
+    /** Diameter of the hexagon (in microns) */
+    double diametro
 
-def allHexes = []
+    /** Logger for structured output */
+    def logger = LoggerFactory.getLogger("HexGridFromBlobs")
 
-blobs.each { blob ->
+    // ---------- Derived geometric parameters ----------
 
-    def roi = blob.getROI()
-    def blobArea = new Area(roi.getShape())
+    /** Distance from hexagon center to vertex */
+    double a
 
-    double xMin = roi.getBoundsX()
-    double yMin = roi.getBoundsY()
-    double w = roi.getBoundsWidth()
-    double h = roi.getBoundsHeight()
+    /** Horizontal spacing between hexagon centers */
+    double stepX
 
-    int nCols = Math.ceil(w / stepX) as int
-    int nRows = Math.ceil(h / stepY) as int
+    /** Vertical spacing between hexagon centers */
+    double stepY
 
-    for (int col = 0; col < nCols; col++) {
-        for (int row = 0; row < nRows; row++) {
+    /** Image plane used for ROI creation */
+    ImagePlane plane
 
-            double cx = xMin + col * stepX
-            double cy = yMin + row * stepY
-            if (col % 2 == 1) cy += stepY / 2
+    /**
+     * Constructor
+     *
+     * @param channelName name of the detection class
+     * @param diametro diameter of the hexagons
+     */
+    HexGridFromBlobs(String channelName, double diametro) {
+        this.channelName = channelName
+        this.diametro = diametro
 
-            // Costruzione esagono flat-top
-            def pts = []
-            for (int k = 0; k < 6; k++) {
-                double angle = Math.toRadians(60 * k)
-                double px = cx + a * Math.cos(angle)
-                double py = cy + a * Math.sin(angle)
-                pts << new Point2(px, py)
-            }
+        // Compute geometric parameters of the hexagonal grid
+        this.a = diametro / 2.0
+        this.stepX = 1.5 * a
+        this.stepY = Math.sqrt(3) * a
 
-            def hexROI = new PolygonROI(pts, plane)
+        // Use the default image plane
+        this.plane = ImagePlane.getDefaultPlane()
+    }
 
-            // Ritaglia l’esagono al blob
-            def hexArea = new Area(hexROI.getShape())
-            hexArea.intersect(blobArea)
+    /**
+     * Executes the hexagonal subdivision process.
+     * All detections of the specified class are processed independently.
+     */
+    void run() {
 
-            if (!hexArea.isEmpty()) {
-                def finalROI = RoiTools.getShapeROI(hexArea, plane)
-                allHexes << PathObjects.createDetectionObject(finalROI, blob.getPathClass())
+        // Retrieve detection objects belonging to the selected class
+        def blobs = getDetectionObjects().findAll {
+            it.getPathClass() == getPathClass(channelName)
+        }
+
+        // Stop execution if no blobs are found
+        if (blobs.isEmpty()) {
+            print " Nessun blob trovato per ${channelName}"
+            return
+        }
+
+        print "INFO: Blob trovati: ${blobs.size()}"
+
+        // List that will contain all generated hexagonal detections
+        def allHexes = []
+
+        // Process each blob independently
+        blobs.each { blob ->
+
+            // Extract the blob ROI and convert it to an Area object
+            def roi = blob.getROI()
+            def blobArea = new Area(roi.getShape())
+
+            // Bounding box of the blob
+            double xMin = roi.getBoundsX()
+            double yMin = roi.getBoundsY()
+            double w = roi.getBoundsWidth()
+            double h = roi.getBoundsHeight()
+
+            // Number of hexagon centers needed to cover the blob area
+            int nCols = Math.ceil(w / stepX) as int
+            int nRows = Math.ceil(h / stepY) as int
+
+            // Iterate over the hexagonal grid
+            for (int col = 0; col < nCols; col++) {
+                for (int row = 0; row < nRows; row++) {
+
+                    // Compute hexagon center position
+                    double cx = xMin + col * stepX
+                    double cy = yMin + row * stepY
+
+                    // Offset every other column to obtain a hexagonal tiling
+                    if (col % 2 == 1)
+                        cy += stepY / 2
+
+                    // ---------- Hexagon construction ----------
+                    def pts = []
+                    for (int k = 0; k < 6; k++) {
+                        double angle = Math.toRadians(60 * k)
+                        pts << new Point2(
+                                cx + a * Math.cos(angle),
+                                cy + a * Math.sin(angle)
+                        )
+                    }
+
+                    // Create the hexagon ROI
+                    def hexROI = new PolygonROI(pts, plane)
+
+                    // ---------- Intersection with blob ----------
+                    def hexArea = new Area(hexROI.getShape())
+                    hexArea.intersect(blobArea)
+
+                    // Skip hexagons that do not intersect the blob
+                    if (hexArea.isEmpty())
+                        continue
+
+                    // ---------- Split disconnected regions ----------
+                    def splitAreas = []
+                    def pi = hexArea.getPathIterator(null)
+                    def coords = new double[6]
+                    def currentPoly = []
+
+                    // Extract individual polygons from the intersection area
+                    while (!pi.isDone()) {
+                        switch (pi.currentSegment(coords)) {
+
+                            case PathIterator.SEG_MOVETO:
+                                if (!currentPoly.isEmpty()) {
+                                    splitAreas << new PolygonROI(new ArrayList(currentPoly), plane)
+                                    currentPoly.clear()
+                                }
+                                currentPoly << new Point2(coords[0], coords[1])
+                                break
+
+                            case PathIterator.SEG_LINETO:
+                                currentPoly << new Point2(coords[0], coords[1])
+                                break
+
+                            case PathIterator.SEG_CLOSE:
+                                if (!currentPoly.isEmpty()) {
+                                    splitAreas << new PolygonROI(new ArrayList(currentPoly), plane)
+                                    currentPoly.clear()
+                                }
+                                break
+                        }
+                        pi.next()
+                    }
+
+                    // Handle any remaining open polygon
+                    if (!currentPoly.isEmpty()) {
+                        splitAreas << new PolygonROI(new ArrayList(currentPoly), plane)
+                        currentPoly.clear()
+                    }
+
+                    if (splitAreas.isEmpty())
+                        continue
+
+                    // ---------- Create detection objects ----------
+                    splitAreas.each { polyROI ->
+
+                        // Create a new detection with the same class as the original blob
+                        def obj = PathObjects.createDetectionObject(polyROI, blob.getPathClass())
+                        def m = obj.getMeasurementList()
+                        def geom = polyROI.getGeometry()
+
+                        // Add geometric measurements
+                        m.put("Area µm²", geom.getArea())
+                        m.put("Perimeter µm", geom.getLength())
+                        m.put("BBox Width µm", polyROI.getBoundsWidth())
+                        m.put("BBox Height µm", polyROI.getBoundsHeight())
+                        m.put("Centroid X", polyROI.getCentroidX())
+                        m.put("Centroid Y", polyROI.getCentroidY())
+
+                        allHexes << obj
+                    }
+                }
             }
         }
+
+        // Remove original blob detections
+        removeObjects(blobs, true)
+
+        // Add the newly created hexagonal detections
+        addObjects(allHexes)
+
+        logger.info(" Creati ${allHexes.size()} esagoni per ${channelName}")
     }
 }
 
-// Rimuove blob originali e aggiunge esagoni
-removeObjects(blobs, true)
-addObjects(allHexes)
+// ---------- Script execution ----------
 
-print "Creati ${allHexes.size()} esagoni per il canale ${channelName}."
+// Process Yellow channel with hexagon diameter of 15 µm
+new HexGridFromBlobs("Yellow", 15).run()
+
+// Process Magenta channel with hexagon diameter of 30 µm
+new HexGridFromBlobs("Magenta", 30).run()
+
+print "script terminato"
