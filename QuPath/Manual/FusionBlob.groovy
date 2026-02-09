@@ -1,0 +1,176 @@
+import qupath.lib.objects.PathObjects
+import qupath.lib.roi.RoiTools
+import java.awt.geom.Area
+import java.awt.BasicStroke
+import org.slf4j.LoggerFactory
+
+/**
+ * HexFusionByAdjacency
+ *
+ * This class merges small hexagonal detections into adjacent larger ones
+ * based on spatial proximity and geometric intersection.
+ * Only detections belonging to a specific class (channel) are processed.
+ */
+class HexFusionByAdjacency {
+
+    /** Detection class name to process */
+    String channelName
+
+    /** Minimum area threshold (µm²) to distinguish big vs small hexes */
+    double minArea = 10.0
+
+    /** Spatial grid size (µm) used to speed up neighborhood search */
+    double gridSize = 50.0
+
+    /** Buffer distance (µm) used to detect adjacency */
+    double buffer = 1.0
+
+    /** Logger (QuPath Log panel) */
+    def logger = LoggerFactory.getLogger(HexFusionByAdjacency)
+
+    /**
+     * Constructor
+     *
+     * @param channelName name of the detection class
+     */
+    HexFusionByAdjacency(String channelName) {
+        this.channelName = channelName
+    }
+
+    /**
+     * Creates a buffered Area around a ROI to allow adjacency detection.
+     *
+     * @param roi input ROI
+     * @param buffer buffer distance in microns
+     * @return buffered Area
+     */
+    Area bufferedArea(def roi, double buffer) {
+        def shape = roi.getShape()
+        def area = new Area(shape)
+        def stroke = new BasicStroke((float)(2 * buffer))
+        area.add(new Area(stroke.createStrokedShape(shape)))
+        return area
+    }
+
+    /**
+     * Executes the fusion process.
+     * Small hexes are merged into adjacent big hexes.
+     * Original detections are removed and replaced by fused ones.
+     */
+    void run() {
+
+        // LOAD DETECTIONS 
+        def allHexes = getDetectionObjects().findAll {
+            it.getPathClass() == getPathClass(channelName)
+        }
+
+        if (allHexes.isEmpty()) {
+            logger.warn("No detections found for class {}", channelName)
+            return
+        }
+
+        logger.info("Initial detections for {}: {}", channelName, allHexes.size())
+        
+        // SPLIT BIG / SMALL 
+        def bigHexes = allHexes.findAll {
+            def area = it.measurements.get("Area µm^2")
+            
+            return area != null && !Double.isNaN(area) && area >= minArea
+        }
+
+        def smallHexes = allHexes.findAll {
+            def area = it.measurements.get("Area µm^2")
+            
+            return area != null && !Double.isNaN(area) && area < minArea
+        }
+
+        logger.info("BIG hexes: {}", bigHexes.size())
+        logger.info("SMALL hexes: {}", smallHexes.size())
+
+        // BUILD SPATIAL GRID
+        def grid = [:].withDefault { [] }
+
+        allHexes.each { obj ->
+            def roi = obj.getROI()
+            def key = [
+                Math.floor(roi.getCentroidX() / gridSize),
+                Math.floor(roi.getCentroidY() / gridSize)
+            ]
+            grid[key] << obj
+        }
+
+        // FUSION PROCESS 
+        def newObjects = []
+        def absorbedSmalls = [] as Set
+
+        bigHexes.each { big ->
+
+            def roiBig = big.getROI()
+            def gx = Math.floor(roiBig.getCentroidX() / gridSize)
+            def gy = Math.floor(roiBig.getCentroidY() / gridSize)
+
+            // Collect neighboring detections from adjacent grid cells
+            def candidates = []
+            for (dx in -1..1)
+                for (dy in -1..1)
+                    candidates += grid[[gx + dx, gy + dy]]
+
+            // Keep only small hexes not already absorbed
+            candidates = candidates.findAll { c ->
+                def cArea = c.measurements.get("Area µm^2")
+                // Deve essere piccolo, non nullo, e non già assorbito
+                return cArea != null && cArea < minArea && !absorbedSmalls.contains(c)
+            }
+
+            def mergedArea = new Area(roiBig.getShape())
+            def bufferedBig = bufferedArea(roiBig, buffer)
+            def absorbedCount = 0
+
+            // Check adjacency and merge intersecting small hexes
+            candidates.each { small ->
+                def a = new Area(bufferedBig)
+                a.intersect(new Area(small.getROI().getShape()))
+                if (!a.isEmpty()) {
+                    mergedArea.add(new Area(small.getROI().getShape()))
+                    absorbedSmalls << small
+                    absorbedCount++
+                }
+            }
+
+            // Create the fused detection
+            def newROI = RoiTools.getShapeROI(mergedArea, roiBig.getImagePlane())
+            def newObj = PathObjects.createDetectionObject(newROI, big.getPathClass())
+
+
+            newObjects << newObj
+
+            logger.debug(
+                "BIG @ ({}, {}) → absorbed {}",
+                roiBig.getCentroidX().round(1),
+                roiBig.getCentroidY().round(1),
+                absorbedCount
+            )
+        }
+
+        // CLEANUP 
+        logger.info("Removing {} original detections", allHexes.size())
+        removeObjects(allHexes, true)
+
+        logger.info("Adding {} fused detections", newObjects.size())
+        addObjects(newObjects)
+
+        logger.info(
+            "Fusion completed for {} → final detections: {}",
+            channelName,
+            newObjects.size()
+        )
+    }
+}
+
+// SCRIPT EXECUTION 
+new HexFusionByAdjacency("Yellow").run()
+new HexFusionByAdjacency("Magenta").run()
+
+selectDetections()
+addShapeMeasurements("AREA", "LENGTH", "CIRCULARITY", "SOLIDITY", "MAX_DIAMETER", "MIN_DIAMETER", "NUCLEUS_CELL_RATIO")
+print "Script execution completed successfully."
