@@ -1,20 +1,27 @@
+import qupath.lib.objects.PathObjects
+
+// Set pixel size (if not already set from metadata)
 setPixelSizeMicrons(0.252600, 0.252600)
+
 // Create tiles
 selectObjectsByClassification("Region*");
 runPlugin('qupath.lib.algorithms.TilerPlugin', '{"tileSizeMicrons":510.0,"trimToROI":true,"makeAnnotations":true,"removeParentAnnotation":false}')
 
+// Find the newly created tiles (unclassified annotations)
 tiles = getAnnotationObjects().findAll{it.getPathClass() == null}
 print tiles
 
-// Create Magenta annotations
+// Create Magenta ANNOTATIONS
 tiles.each { tile ->
     selectObjects(tile)
+    // Note: addPixelClassifierMeasurements is technically optional if createAnnotations is run immediately, 
+    // but useful if you need measurements on the tile itself.
     addPixelClassifierMeasurements("CD20_full_thr1", "CD20_full_thr1")
     createAnnotationsFromPixelClassifier("CD20_full_thr1", 10.0, 0.0, "SPLIT", "IGNORE_EXISTING")
     addShapeMeasurements("AREA", "LENGTH", "CIRCULARITY", "SOLIDITY", "MAX_DIAMETER", "MIN_DIAMETER", "NUCLEUS_CELL_RATIO")
 }
 
-// Create Yellow annotations
+// Create Yellow ANNOTATIONS
 tiles.each { tile ->
     selectObjects(tile)
     addPixelClassifierMeasurements("CD3_full_thr1", "CD3_full_thr1")
@@ -22,27 +29,34 @@ tiles.each { tile ->
     addShapeMeasurements("AREA", "LENGTH", "CIRCULARITY", "SOLIDITY", "MAX_DIAMETER", "MIN_DIAMETER", "NUCLEUS_CELL_RATIO")
 }
 
-// Convert all annotations (Magenta/Yellow) to DETECTIONS
-// Trova tutte le annotazioni appena create
+// Convert ALL annotations (Magenta/Yellow) to DETECTIONS
+
+// Find all newly created annotations
 def annotsToConvert = getAnnotationObjects().findAll {
     it.getPathClass() == getPathClass("Magenta") || it.getPathClass() == getPathClass("Yellow")
 }
 
 if (annotsToConvert.isEmpty()) {
-    print "Errore: Nessuna annotazione 'Magenta' o 'Yellow' è stata creata. Controlla i tuoi Pixel Classifiers."
+    print "Error: No 'Magenta' or 'Yellow' annotations created. Check your Pixel Classifiers."
     return
 }
 
-// Create a list of new detections
+// Create a list of new detections based on the annotations
 def newDetections = annotsToConvert.collect {
     return PathObjects.createDetectionObject(it.getROI(), it.getPathClass())
 }
 
+// Calculate measurements for the new detections
 selectDetections();
 addShapeMeasurements("AREA", "LENGTH", "CIRCULARITY", "SOLIDITY", "MAX_DIAMETER", "MIN_DIAMETER")
 
-// // Remove old annotations and add the new detections
+// Remove old annotations and add the new detections
 removeObjects(annotsToConvert, true)
 addObjects(newDetections)
 
-print "Processing Complete: Created ${newDetections.size()} total detection 'blobs'."
+// Final hierarchy resolution and distance calculations
+selectDetections();
+detectionCentroidDistances()
+resolveHierarchy()
+
+print "Step 1 completed: Created ${newDetections.size()} total 'blob' detections."
