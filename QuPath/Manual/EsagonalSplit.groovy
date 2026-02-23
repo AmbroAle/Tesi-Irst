@@ -3,13 +3,13 @@ import qupath.lib.roi.*
 import qupath.lib.regions.ImagePlane
 import qupath.lib.geom.Point2
 import java.awt.geom.Area
-import java.awt.geom.PathIterator
 import org.slf4j.LoggerFactory
+import qupath.lib.roi.GeometryTools
 
 /**
  * HexGridFromBlobs
  * * Splits blobs into hexagons ONLY if area >= 300 µm².
- * Executes Tile-by-Tile to ensure correct hierarchy and performance.
+ * * Maintaining the shape of the original structure.
  */
 class HexGridFromBlobs {
 
@@ -48,35 +48,24 @@ class HexGridFromBlobs {
         this.plane = ImagePlane.getDefaultPlane()
     }
 
-    /**
-     * Executes subdivision searching for blobs ONLY inside the 'parentObject' (the Tile).
-     */
     void runOnParent(def parentObject) {
 
-        // Find child blobs of the current Tile belonging to the specific channel
+        // Find child blobs of the current Tile
         def blobs = parentObject.getChildObjects().findAll {
             it.isDetection() && it.getPathClass() == getPathClass(channelName)
         }
 
-        if (blobs.isEmpty()) {
-            return
-        }
+        if (blobs.isEmpty()) return
 
         def allHexes = []
         def blobsToRemove = [] 
 
         blobs.each { blob ->
 
-            // 1. READ AREA
             def areaMicrons = blob.getMeasurementList().get("Area µm^2")
-
-            // If measurement is missing, skip
             if (areaMicrons == null || Double.isNaN(areaMicrons)) return 
-
-            // 2. FILTER: If small (< 300), SKIP and leave intact
             if (areaMicrons < minBlobAreaToSplit) return 
 
-            // 3. IF LARGE (>= 300): PROCEED TO SPLIT
             blobsToRemove << blob
             
             def roi = blob.getROI()
@@ -105,44 +94,30 @@ class HexGridFromBlobs {
 
                     def hexROI = new PolygonROI(pts, plane)
                     def hexArea = new Area(hexROI.getShape())
+                    
+                    // Pure mathematical intersection
                     hexArea.intersect(blobArea)
 
                     if (hexArea.isEmpty()) continue
 
-                    def splitAreas = []
-                    def pi = hexArea.getPathIterator(null)
-                    def coords = new double[6]
-                    def currentPoly = []
-
-                    while (!pi.isDone()) {
-                        switch (pi.currentSegment(coords)) {
-                            case PathIterator.SEG_MOVETO:
-                                if (!currentPoly.isEmpty()) {
-                                    splitAreas << new PolygonROI(new ArrayList(currentPoly), plane)
-                                    currentPoly.clear()
-                                }
-                                currentPoly << new Point2(coords[0], coords[1])
-                                break
-                            case PathIterator.SEG_LINETO:
-                                currentPoly << new Point2(coords[0], coords[1])
-                                break
-                            case PathIterator.SEG_CLOSE:
-                                if (!currentPoly.isEmpty()) {
-                                    splitAreas << new PolygonROI(new ArrayList(currentPoly), plane)
-                                    currentPoly.clear()
-                                }
-                                break
-                        }
-                        pi.next()
-                    }
-                    if (!currentPoly.isEmpty()) {
-                        splitAreas << new PolygonROI(new ArrayList(currentPoly), plane)
-                    }
-
-                    if (splitAreas.isEmpty()) continue
-
-                    splitAreas.each { polyROI ->
-                        def obj = PathObjects.createDetectionObject(polyROI, blob.getPathClass())
+                    // GEOMETRY ENGINE (GEOMETRY TOOLS)
+                    
+                    // Convert the Java Area into a Temporary QuPath ROI
+                    def tempRoi = RoiTools.getShapeROI(hexArea, plane)
+                    
+                    // Extract JTS Geometry directly from the ROI
+                   def geom = tempRoi.getGeometry()
+                    
+                    // If the intersection created multiple disconnected islands, iterate through them.
+            
+                    for (int i = 0; i < geom.getNumGeometries(); i++) {
+                        def singleGeom = geom.getGeometryN(i)
+                        
+                        // Re-convert the single island (with its holes) into the final ROI
+                        def finalRoi = GeometryTools.geometryToROI(singleGeom, plane)
+                        
+                        // Create the object
+                        def obj = PathObjects.createDetectionObject(finalRoi, blob.getPathClass())
                         allHexes << obj
                     }
                 }
@@ -151,14 +126,7 @@ class HexGridFromBlobs {
 
         // APPLY CHANGES 
         if (!blobsToRemove.isEmpty()) {
-            
-            // 1. Remove old large blobs
-            // Using generic removeObjects, QuPath handles hierarchy
             removeObjects(blobsToRemove, true)
-            
-            // 2. Add new hexagons
-            // Using generic addObjects. Since they are geometrically INSIDE the tile,
-            // resolveHierarchy() at the end will place them in the right spot.
             addObjects(allHexes)
         }
     }
@@ -223,7 +191,7 @@ if (tiles.isEmpty()) {
 }
 print "Found ${tiles.size()} Tiles. Starting processing..."
 
-// 2. Pre-processing measurements (Required to read the area of existing blobs)
+// 2. Pre-processing measurements 
 print "Calculating initial measurements..."
 selectDetections() 
 addShapeMeasurements("AREA", "LENGTH", "CIRCULARITY", "SOLIDITY", "MAX_DIAMETER", "MIN_DIAMETER", "NUCLEUS_CELL_RATIO")
@@ -241,10 +209,8 @@ tiles.eachWithIndex { tile, i ->
     
     print "Processing Tile ${i+1}/${tiles.size()}..."
     
-    // Select the current tile
     selectObjects(tile)
     
-    // Execute on tile children
     processorYellow.runOnParent(tile)
     processorMagenta.runOnParent(tile)
 }
@@ -254,11 +220,17 @@ print " Processing completed. Updating hierarchy..."
 // 5. FINAL HIERARCHY FIX
 resetSelection() 
 
-// This command fixes parenting (puts detections into the correct tiles)
 resolveHierarchy()
 
 print "Calculating final measurements..."
 selectDetections()
 addShapeMeasurements("AREA", "LENGTH", "CIRCULARITY", "SOLIDITY", "MAX_DIAMETER", "MIN_DIAMETER", "NUCLEUS_CELL_RATIO")
+
+// Safe distance calculation
+try {
+    detectionCentroidDistances()
+} catch (Exception e) {
+    print "Warning: Could not calculate distances (likely missing one of the cell classes)."
+}
 
 print "Script completed successfully."
